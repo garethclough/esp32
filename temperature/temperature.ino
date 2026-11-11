@@ -4,14 +4,22 @@
 #include <time.h>
 #include "esp_sntp.h"
 #include <DHT.h>
+#include "esp_task_wdt.h"
+#include "esp_system.h"
 
 #define DHT_PIN 4
 #define DHT_TYPE DHT11
 #define DURATION_HIGH_MIN 40
-#define RECORD_LIST_START 8
+#define RECORD_LIST_START 13
 #define EEPROM_SIZE 4096
+#define MODE_PIN 5
+#define EEPROM_MAGIC_NUMBER 0
+#define EEPROM_MODE 4
+#define EEPROM_NEXT_RECORD 5
+#define EEPROM_RECORD_COUNT 9
+
 // change this to reset eeprom
-#define MAGIC_NUMBER 12345678
+#define MAGIC_NUMBER 666671
 
 struct Reading {
     float temperature;
@@ -23,6 +31,7 @@ String ssid = "Livebox6-419D";
 String password = "63FTosLRGK5X";
 String ntpServer = "pool.ntp.org";
 int currentEepromAddress = 0;
+int previousButtonState = LOW;
 int recordCount = 0;
 DHT dht(DHT_PIN, DHT_TYPE);
 
@@ -32,6 +41,10 @@ bool readingError = false;
 bool readingSuccess = false;
 float lastTemperature = 0;
 float lastHumidity = 0;
+bool deepSleepMode = false;
+
+unsigned long previousMillis = 0;
+const unsigned long readingInterval = 10000; // 10 sec
 
 WebServer server(80);
 
@@ -70,36 +83,38 @@ void synchroniseTime() {
   }  
 }
 
-void IRAM_ATTR recordEdge() {
-    unsigned long now = micros();
-
-    if (edgeCount < 100) {
-        edgeDuration[edgeCount] = now - lastEdgeTime;
-        edgeLevel[edgeCount] = digitalRead(DHT_PIN);
-        edgeCount++;
-    }
-
-    lastEdgeTime = now;
-}
-
 void handleHomepage() {
 
     String html = "<html><body>";
 
     html += "<h1>ESP32 Sensor Monitor</h1>";
 
-    if (readingSuccess) {
+    Reading r[10]; 
+    int numReadings = getPreviousReadings(r, 10, currentEepromAddress, recordCount);
+    if (numReadings > 0) {
       html += "<p>Temperature: ";
-      html += String(temperature, 1);
+      html += String(r[0].temperature, 1);
       html += " &deg;C</p>";
-
       html += "<p>Humidity: ";
-      html += String(humidity, 1);
+      html += String(r[0].humidity, 1);
       html += " %</p>";
-    } else {
-      html += "<p>No successfull reading obtained.<p>";
-    }
+      time_t t = (time_t)r[0].timestamp;
+      html += "<p>";
+      html += ctime(&t);
+      html += "</p>";
 
+      if (numReadings > 1) {
+        html += "<h4>Previous Readings:</h4><table cellpadding='5'>"; 
+        html += "<tr><th>Time</th><th>Temperature</th><th>Humidity</th></tr>";   
+        for (int i=1; i < numReadings; i++) {
+          time_t t = (time_t)r[i].timestamp;
+          String dateTime = String(ctime(&t));
+          dateTime.trim();
+          html += "<tr><td>" + dateTime + "</td><td>" + r[i].temperature + " &deg;C</td><td>" + r[i].humidity + "%</td></tr>";
+        }
+        html += "</table>";              
+      }
+    }
     if (readingError) {
       html += "<p>Warning: Last reading failed.</p>";
     }
@@ -109,12 +124,36 @@ void handleHomepage() {
     server.send(200, "text/html", html);
 }
 
+void startDeepSleep() {
+  pinMode(33, INPUT_PULLUP);
+  esp_sleep_enable_timer_wakeup(20ULL * 1000000ULL); // set to 20s for demo (normally would be longer)
+  // Wake when GPIO 33 goes LOW - with pull up its 1 when not connected and 0 if connected to grounf
+  esp_sleep_enable_ext0_wakeup(GPIO_NUM_33, 0);
+  esp_deep_sleep_start();     
+}
+
+void initWatchdog() {
+  esp_task_wdt_config_t wdt_config = {
+      .timeout_ms = 10000,
+      .idle_core_mask = 0,
+      .trigger_panic = true
+  };
+
+  esp_task_wdt_init(&wdt_config);
+  esp_task_wdt_add(NULL);
+}
+
+void disableWatchdog() {
+    esp_task_wdt_delete(NULL);
+    esp_task_wdt_deinit();  
+}
+
 void setup() {
   Serial.begin(115200);
   EEPROM.begin(EEPROM_SIZE);
 
 	unsigned int magic;
-	EEPROM.get(0, magic);
+	EEPROM.get(EEPROM_MAGIC_NUMBER, magic);
 
 	if (magic != MAGIC_NUMBER) {
 			// First run: initialise EEPROM
@@ -122,19 +161,31 @@ void setup() {
 
 			currentEepromAddress = RECORD_LIST_START;
 			recordCount = 0;
-
-			EEPROM.put(0, (unsigned int)MAGIC_NUMBER);
-			EEPROM.put(4, currentEepromAddress);
-			EEPROM.put(6, recordCount);
+      EEPROM.put(EEPROM_MAGIC_NUMBER, (unsigned int)MAGIC_NUMBER);
+      EEPROM.put(EEPROM_MODE, deepSleepMode);
+			EEPROM.put(EEPROM_NEXT_RECORD, currentEepromAddress);
+			EEPROM.put(EEPROM_RECORD_COUNT, recordCount);
 			EEPROM.commit();
 	} else {
 			// Previously initialised: retrieve saved values
 			Serial.println("Loading EEPROM data");
-			EEPROM.get(4, currentEepromAddress);
-			EEPROM.get(6, recordCount);
+      EEPROM.get(EEPROM_MODE, deepSleepMode);
+			EEPROM.get(EEPROM_NEXT_RECORD, currentEepromAddress);
+			EEPROM.get(EEPROM_RECORD_COUNT, recordCount);
 	}
 
+  esp_sleep_wakeup_cause_t wakeupReason = esp_sleep_get_wakeup_cause();
+  if (wakeupReason == ESP_SLEEP_WAKEUP_EXT0) {
+      Serial.println("Woken by button press!");
+      deepSleepMode = false;
+      EEPROM.put(EEPROM_MODE, deepSleepMode);
+      EEPROM.commit();
+  }
 
+  esp_reset_reason_t reason = esp_reset_reason();
+  if (reason == ESP_RST_TASK_WDT || reason == ESP_RST_WDT) {
+      Serial.println("Watchdog restart detected!");
+  }
 
 	Serial.println("Connecting to WiFi...");
 	WiFi.begin(ssid, password);
@@ -157,21 +208,21 @@ void setup() {
 	Serial.println("Web server started");
 
   dht.begin();
-}
 
-// if x = 20 and y = 2 return 20.3, if y = 33 return 20.33 etc.
-float convertToFloat(byte x, byte y) {
-    if (y == 0) {
-        return x;
-    }
+  if (deepSleepMode) {
+    Serial.println("Deep Sleep Mode");
+    takeReading();
+    startDeepSleep();
+  }
 
-    int digits = (int)log10(y) + 1;
-
-    return x + y / pow(10, digits);
+  // not executed in deep sleep mode
+  pinMode(MODE_PIN, INPUT_PULLUP);
+  previousButtonState = digitalRead(MODE_PIN);
+  initWatchdog();
 }
 
 void saveReading(float temperature, float humidity) {
-
+  Serial.println(temperature);
     struct tm timeinfo;
 
     if (getLocalTime(&timeinfo)) {
@@ -187,137 +238,94 @@ void saveReading(float temperature, float humidity) {
 			EEPROM.put(currentEepromAddress, currentReading);
 
 			// loop round and overwrite old records
-			currentEepromAddress += sizeof(currentReading);
-			if (currentEepromAddress + sizeof(currentEepromAddress) > EEPROM_SIZE) {
+			currentEepromAddress += sizeof(Reading);
+			if (currentEepromAddress + sizeof(Reading) > EEPROM_SIZE) {
 				currentEepromAddress = RECORD_LIST_START;
 			}
 			recordCount++;
 
-			EEPROM.put(4, recordCount);
-			EEPROM.put(6, currentEepromAddress);
-
-			currentEepromAddress += sizeof(Reading);
+			EEPROM.put(EEPROM_RECORD_COUNT, recordCount);
+			EEPROM.put(EEPROM_NEXT_RECORD, currentEepromAddress);
       EEPROM.commit();
     }    
 }
 
-void printSavedReading() {
-    Reading previousReading;
+int getPreviousReadings(Reading *r, int size, int recordAddress, int numRecords) {
+  int counter = 0;
+  int maxRecords = EEPROM_SIZE - RECORD_LIST_START /  sizeof(Reading);
 
-    EEPROM.get(0, previousReading);
-    Serial.println("Previous Reading");
-    Serial.print("Temperature: ");
-    Serial.println(previousReading.temperature);
+  while (counter < numRecords && counter < size) {
+    recordAddress -= sizeof(Reading);
 
-    Serial.print("Humidity: ");
-    Serial.println(previousReading.humidity);
-
-    Serial.print("Timestamp: ");
-    Serial.println(previousReading.timestamp);    
+    if (recordAddress < RECORD_LIST_START) {
+      recordAddress = RECORD_LIST_START + ((maxRecords - 1) * sizeof(Reading));
+    } 
+    EEPROM.get(recordAddress, r[counter]);
+    counter++;
+  }
+  return counter;
 }
 
-bool getReadings(float &temperature, float &pressure) {
+void takeReading() {
+  humidity = dht.readHumidity();
+  temperature = dht.readTemperature();
 
-  // Send start signal
-  pinMode(DHT_PIN, OUTPUT);
-  digitalWrite(DHT_PIN, LOW);
-  delay(20);
-
-  // Release the data line
-  pinMode(DHT_PIN, INPUT_PULLUP);
-
-  edgeCount = 0;
-  lastEdgeTime = micros();
-
-  // Record every change of the data signal
-  attachInterrupt(
-    digitalPinToInterrupt(DHT_PIN),
-    recordEdge,
-    CHANGE
-  );
-
-  // Allow time for the sensor to transmit
-  delay(6);
-  detachInterrupt(digitalPinToInterrupt(DHT_PIN));
-
-  byte data[5] = {0, 0, 0, 0, 0};
-  int bitCount = 0;
-
-  // note that the first 4 bits are the initial response pulses
-  for (int i = 4; i < edgeCount && bitCount < 40; i++) {
-
-      // Only process HIGH pulse durations
-      if (edgeLevel[i] == LOW) {
-
-          int bitValue =
-              edgeDuration[i] > DURATION_HIGH_MIN ? 1 : 0;
-
-          int byteIndex = bitCount / 8;
-          int bitIndex = 7 - (bitCount % 8);
-
-          if (bitValue == 1) {
-              data[byteIndex] |= (1 << bitIndex);
-          }
-
-          bitCount++;
-      }
-  }
-
-  Serial.print("Bits received: ");
-  Serial.println(bitCount);
-
-  for (int i = 0; i < 5; i++) {
-    Serial.print(i);
-    Serial.print(": ");
-    Serial.println(data[i]);
-  }
-
-  temperature = convertToFloat(data[2], data[3]);
-  pressure = convertToFloat(data[0], data[1]);
-
-  byte calculatedChecksum = data[0] + data[1] + data[2] + data[3];
-  if (calculatedChecksum == data[4]) {
-      Serial.println("Data is valid");
+  if (isnan(humidity) || isnan(temperature)) {
+      Serial.println("Failed to read sensor!");
+      readingError = true;
   } else {
-      Serial.println("Checksum error");
-      return false;
-  }  
-  return true;
+    // this means that is was successfull at least once 
+    readingSuccess = true;
+    readingError = false;
+    /*
+    Serial.print("Temperature: ");
+    Serial.print(temperature);
+    Serial.println(" °C");
+
+    Serial.print("Humidity: ");
+    Serial.print(humidity);
+    Serial.println(" %");
+*/
+    saveReading(temperature, humidity);
+/*
+    Reading r[10]; 
+    int numReadings = getPreviousReadings(r, 10, currentEepromAddress, recordCount);
+    for (int i=0; i < numReadings; i++) {
+      time_t t = (time_t)r[i].timestamp;
+      Serial.print(ctime(&t));
+      Serial.print(" - ");
+      Serial.println(r[i].temperature);   
+    }*/   
+  }
 }
 
 void loop() {
+  esp_task_wdt_reset();
 
-    float humidity = dht.readHumidity();
-    float temperature = dht.readTemperature();
+  unsigned long currentMillis = millis();
 
-    if (isnan(humidity) || isnan(temperature)) {
-        Serial.println("Failed to read sensor!");
-    } else {
-        Serial.print("Temperature: ");
-        Serial.print(temperature);
-        Serial.println(" °C");
+  if (currentMillis - previousMillis >= readingInterval || previousMillis == 0) {
+    previousMillis = currentMillis;
 
-        Serial.print("Humidity: ");
-        Serial.print(humidity);
-        Serial.println(" %");
-    }
+    Serial.println("Taking reading...");
+    takeReading();
+  }
+  
+  int currentState = digitalRead(MODE_PIN);
 
-    delay(2000);
-
-/*
-  server.handleClient();
-  readingError = !getReadings(temperature, humidity);
-  if (!readingError) {
-    readingSuccess = true;
-    Serial.print("Temp: ");
-    Serial.println(temperature);
-    Serial.print("Humidity: ");
-    Serial.println(humidity);
-    saveReading(temperature, humidity);
-  } else {
-    Serial.println("Sensor reading failed.");
+  if (currentState == HIGH && previousButtonState == LOW) {
+    disableWatchdog();
+    deepSleepMode = true;
+    Serial.println("Entering Deep Sleep Mode");
+    delay(100); // Allow serial message to print
+    EEPROM.put(EEPROM_MODE, deepSleepMode);
+    EEPROM.commit();
+    // Wake after 2 mins
+    startDeepSleep();
   }
 
-  delay(20000);
-  */
+  previousButtonState = currentState;
+
+  server.handleClient();
+  delay(100);
 }
