@@ -38,21 +38,12 @@ DHT dht(DHT_PIN, DHT_TYPE);
 float temperature = 0.0;
 float humidity = 0.0;
 bool readingError = false;
-bool readingSuccess = false;
-float lastTemperature = 0;
-float lastHumidity = 0;
 bool deepSleepMode = false;
 
 unsigned long previousMillis = 0;
 const unsigned long readingInterval = 10000; // 10 sec
 
 WebServer server(80);
-
-// volatile tells compiler to always read value from memory
-volatile unsigned long edgeDuration[100];
-volatile byte edgeLevel[100];
-volatile int edgeCount = 0;
-volatile unsigned long lastEdgeTime = 0;
 
 bool ntpSynced = false;
 
@@ -80,7 +71,7 @@ void synchroniseTime() {
       Serial.println("NTP confirmed.");
   } else {
       Serial.println("NTP synchronisation failed.");
-  }  
+  }
 }
 
 void handleHomepage() {
@@ -89,7 +80,7 @@ void handleHomepage() {
 
     html += "<h1>ESP32 Sensor Monitor</h1>";
 
-    Reading r[10]; 
+    Reading r[10];
     int numReadings = getPreviousReadings(r, 10, currentEepromAddress, recordCount);
     if (numReadings > 0) {
       html += "<p>Temperature: ";
@@ -104,15 +95,15 @@ void handleHomepage() {
       html += "</p>";
 
       if (numReadings > 1) {
-        html += "<h4>Previous Readings:</h4><table cellpadding='5'>"; 
-        html += "<tr><th>Time</th><th>Temperature</th><th>Humidity</th></tr>";   
+        html += "<h4>Previous Readings:</h4><table cellpadding='5'>";
+        html += "<tr><th>Time</th><th>Temperature</th><th>Humidity</th></tr>";
         for (int i=1; i < numReadings; i++) {
           time_t t = (time_t)r[i].timestamp;
           String dateTime = String(ctime(&t));
           dateTime.trim();
           html += "<tr><td>" + dateTime + "</td><td>" + r[i].temperature + " &deg;C</td><td>" + r[i].humidity + "%</td></tr>";
         }
-        html += "</table>";              
+        html += "</table>";
       }
     }
     if (readingError) {
@@ -129,7 +120,7 @@ void startDeepSleep() {
   esp_sleep_enable_timer_wakeup(20ULL * 1000000ULL); // set to 20s for demo (normally would be longer)
   // Wake when GPIO 33 goes LOW - with pull up its 1 when not connected and 0 if connected to grounf
   esp_sleep_enable_ext0_wakeup(GPIO_NUM_33, 0);
-  esp_deep_sleep_start();     
+  esp_deep_sleep_start();
 }
 
 void initWatchdog() {
@@ -145,7 +136,7 @@ void initWatchdog() {
 
 void disableWatchdog() {
     esp_task_wdt_delete(NULL);
-    esp_task_wdt_deinit();  
+    esp_task_wdt_deinit();
 }
 
 void setup() {
@@ -203,10 +194,6 @@ void setup() {
 
   synchroniseTime();
 
-	server.on("/", handleHomepage);
-	server.begin();
-	Serial.println("Web server started");
-
   dht.begin();
 
   if (deepSleepMode) {
@@ -214,6 +201,10 @@ void setup() {
     takeReading();
     startDeepSleep();
   }
+
+	server.on("/", handleHomepage);
+	server.begin();
+	Serial.println("Web server started");
 
   // not executed in deep sleep mode
   pinMode(MODE_PIN, INPUT_PULLUP);
@@ -247,19 +238,19 @@ void saveReading(float temperature, float humidity) {
 			EEPROM.put(EEPROM_RECORD_COUNT, recordCount);
 			EEPROM.put(EEPROM_NEXT_RECORD, currentEepromAddress);
       EEPROM.commit();
-    }    
+    }
 }
 
 int getPreviousReadings(Reading *r, int size, int recordAddress, int numRecords) {
   int counter = 0;
-  int maxRecords = EEPROM_SIZE - RECORD_LIST_START /  sizeof(Reading);
+  int maxRecords = (EEPROM_SIZE - RECORD_LIST_START) / sizeof(Reading);
 
   while (counter < numRecords && counter < size) {
     recordAddress -= sizeof(Reading);
 
     if (recordAddress < RECORD_LIST_START) {
       recordAddress = RECORD_LIST_START + ((maxRecords - 1) * sizeof(Reading));
-    } 
+    }
     EEPROM.get(recordAddress, r[counter]);
     counter++;
   }
@@ -274,28 +265,8 @@ void takeReading() {
       Serial.println("Failed to read sensor!");
       readingError = true;
   } else {
-    // this means that is was successfull at least once 
-    readingSuccess = true;
     readingError = false;
-    /*
-    Serial.print("Temperature: ");
-    Serial.print(temperature);
-    Serial.println(" °C");
-
-    Serial.print("Humidity: ");
-    Serial.print(humidity);
-    Serial.println(" %");
-*/
     saveReading(temperature, humidity);
-/*
-    Reading r[10]; 
-    int numReadings = getPreviousReadings(r, 10, currentEepromAddress, recordCount);
-    for (int i=0; i < numReadings; i++) {
-      time_t t = (time_t)r[i].timestamp;
-      Serial.print(ctime(&t));
-      Serial.print(" - ");
-      Serial.println(r[i].temperature);   
-    }*/   
   }
 }
 
@@ -310,7 +281,7 @@ void loop() {
     Serial.println("Taking reading...");
     takeReading();
   }
-  
+
   int currentState = digitalRead(MODE_PIN);
 
   if (currentState == HIGH && previousButtonState == LOW) {
