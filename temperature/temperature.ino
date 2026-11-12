@@ -9,7 +9,6 @@
 
 #define DHT_PIN 4
 #define DHT_TYPE DHT11
-#define DURATION_HIGH_MIN 40
 #define RECORD_LIST_START 13
 #define EEPROM_SIZE 4096
 #define MODE_PIN 5
@@ -118,7 +117,7 @@ void handleHomepage() {
 void startDeepSleep() {
   pinMode(33, INPUT_PULLUP);
   esp_sleep_enable_timer_wakeup(20ULL * 1000000ULL); // set to 20s for demo (normally would be longer)
-  // Wake when GPIO 33 goes LOW - with pull up its 1 when not connected and 0 if connected to grounf
+  // Wake when GPIO 33 goes LOW - with pull up its 1 when not connected and 0 if connected to ground
   esp_sleep_enable_ext0_wakeup(GPIO_NUM_33, 0);
   esp_deep_sleep_start();
 }
